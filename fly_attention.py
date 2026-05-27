@@ -7,8 +7,8 @@ Based on Drosophila central complex connectome structure:
        ↓
   Portal / BU-LAL equivalent         — FIRST cross-stream convergence point
        ↓                               topographic, not fully mixed
-  Bias Cachneck (Δ7)         — sparse, inhibitory, compress to 8 values
-       ↓          ↑
+  Bias Cachneck (Δ7)                 — sparse, inhibitory side channel
+       ↓          ↑                    NOT a bottleneck — biases layer, never compresses it
   Cache (E-PG / P-EN reciprocal)     — inter-pass feedback, held across denoising steps
        ↓                               residual history accumulates naturally
   Output — inhibitory subtraction    — suppress established signal, pass novel
@@ -24,6 +24,16 @@ Streams NEVER talk to each other directly — only portal → bcn → cache → 
 Complexity: O(n) in sequence length — no O(n²) anywhere.
 Parameters: ~38x fewer than standard attention at d=768.
 Drop-in replacement: d_model in → d_model out.
+
+NOTE — Functionally inspired, not a biological simulation:
+  This is NOT an attempt to accurately simulate the Drosophila brain.
+  The biological structure is the inspiration; the computational function is the goal.
+  We extract the PRINCIPLES — parallel independent streams, sparse inhibitory feedback,
+  reciprocal cache attractors, topographic convergence — and implement them as efficient
+  tensor operations optimized for modern hardware (TPU/mobile NPU).
+  Parameter counts, connectivity patterns, and neuron types are chosen for hardware
+  efficiency and gradient stability, not biological accuracy.
+  Think of it like LSTMs: inspired by memory mechanisms, not a neuroscience simulation.
 """
 
 import torch
