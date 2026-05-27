@@ -262,9 +262,11 @@ class FlyAttention(nn.Module):
         4. Reformat loss: bottleneck must genuinely transform (not just scale)
         """
         # 1. Inhibitory — inhibition should correlate with x (suppress established)
+        # eps prevents NaN gradient when input is near-zero (1/sqrt(0) = inf in backward)
+        _eps = 1e-8
         loss_inhibitory = -F.cosine_similarity(
-            inhibition.reshape(inhibition.shape[0], -1),
-            x.detach().reshape(x.shape[0], -1),
+            inhibition.reshape(inhibition.shape[0], -1) + _eps,
+            x.detach().reshape(x.shape[0], -1) + _eps,
             dim=1
         ).mean()
 
@@ -286,13 +288,14 @@ class FlyAttention(nn.Module):
         )  # (B, T, 1) scalar per position
         bottleneck_mag = bottleneck.norm(dim=-1, keepdim=True)  # (B, T, 1)
         loss_reformat = F.cosine_similarity(
-            bottleneck_mag.reshape(bottleneck.shape[0], -1),
-            x_pooled.reshape(x.shape[0], -1),
+            bottleneck_mag.reshape(bottleneck.shape[0], -1) + _eps,
+            x_pooled.reshape(x.shape[0], -1) + _eps,
             dim=1
         ).mean().clamp(min=-0.3)
 
         # 5. Coherence — bottleneck should have non-trivial variance
-        bottleneck_var = bottleneck.var(dim=(0, 1)).mean()
+        # unbiased=False prevents division by zero when batch*time == 1
+        bottleneck_var = bottleneck.var(dim=(0, 1), unbiased=False).mean()
         loss_coherence = -bottleneck_var.clamp(max=1.0)
 
         # 6. Overflow forcefield — exponential penalty approaching clamp boundary
