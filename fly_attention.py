@@ -176,6 +176,8 @@ class FlyAttention(nn.Module):
         portal_out_s = torch.matmul(p_in, self.portal_weight)  # (B, portal_heads, T, portal_dim)
         portal_out = portal_out_s.permute(0, 2, 1, 3).contiguous().view(B, T, D)
         portal_out = self.portal_norm(portal_out)
+        # clamp to bfloat16 safe range — gradient still flows, model learns to stay in range
+        portal_out = portal_out.clamp(-1e4, 1e4)
 
         # ── Step 3: Δ7 bottleneck ─────────────────────────────────────────────
         # Apply sparse mask functionally — avoids .data mutation mid-forward
@@ -189,10 +191,10 @@ class FlyAttention(nn.Module):
         # detach() intentional — gradients don't flow through cache across steps
         cache_prev = self.cache_epg.detach().clone()
 
-        raw_epg = bottleneck.detach().mean(dim=(0, 1))
+        raw_epg = bottleneck.detach().mean(dim=(0, 1)).clamp(-1e4, 1e4)
         self.cache_epg.copy_(F.pad(raw_epg, (0, self._cache_pad - nb)))
 
-        raw_pen = self.pen_proj(portal_out.detach().mean(dim=(0, 1)))
+        raw_pen = self.pen_proj(portal_out.detach().mean(dim=(0, 1))).clamp(-1e4, 1e4)
         self.cache_pen.copy_(F.pad(raw_pen, (0, self._cache_pad - nb)))
 
         # ── Step 5: Inhibitory output ─────────────────────────────────────────
@@ -208,12 +210,15 @@ class FlyAttention(nn.Module):
 
     def detach_caches(self):
         """Sever cache graph history between training steps.
-        Call after backward() to prevent autograd from backpropping
-        through cached state across steps. Cache values are preserved
-        but detached from the computation graph.
+        Also zeros any NaN/inf values to prevent cascade corruption.
         """
         self.cache_epg.detach_()
         self.cache_pen.detach_()
+        # zero NaN caches — prevents a single bad step from cascading forever
+        if not torch.isfinite(self.cache_epg).all():
+            self.cache_epg.zero_()
+        if not torch.isfinite(self.cache_pen).all():
+            self.cache_pen.zero_()
 
     def compute_aux_losses(self) -> dict[str, torch.Tensor]:
         """
@@ -476,8 +481,10 @@ class FlyAttentionPair(nn.Module):
 
         tok_portal_out = self.tok_attn.portal_norm(
             torch.matmul(tok_p, self.tok_attn.portal_weight).permute(0,2,1,3).contiguous().view(B_tok, T_tok, D))
+        tok_portal_out = tok_portal_out.clamp(-1e4, 1e4)
         sys_portal_out = self.sys_attn.portal_norm(
             torch.matmul(sys_p, self.sys_attn.portal_weight).permute(0,2,1,3).contiguous().view(B_sys, T_sys, D))
+        sys_portal_out = sys_portal_out.clamp(-1e4, 1e4)
 
         # ── Step 4: Δ7 bottleneck + cache update — in-graph, no host sync ────
         # Apply sparse mask functionally — no .data mutation mid-forward
@@ -491,10 +498,10 @@ class FlyAttentionPair(nn.Module):
                          self.sys_attn.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
 
         # in-place .copy_() + detach — stays on device, no graph break, no autograd conflict
-        self.tok_attn.cache_epg.copy_(F.pad(tok_bottleneck.detach().mean(dim=(0,1)), (0, pad-nb)))
-        self.sys_attn.cache_epg.copy_(F.pad(sys_bottleneck.detach().mean(dim=(0,1)), (0, pad-nb)))
-        self.tok_attn.cache_pen.copy_(F.pad(self.tok_attn.pen_proj(tok_portal_out.detach().mean(dim=(0,1))), (0, pad-nb)))
-        self.sys_attn.cache_pen.copy_(F.pad(self.sys_attn.pen_proj(sys_portal_out.detach().mean(dim=(0,1))), (0, pad-nb)))
+        self.tok_attn.cache_epg.copy_(F.pad(tok_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
+        self.sys_attn.cache_epg.copy_(F.pad(sys_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
+        self.tok_attn.cache_pen.copy_(F.pad(self.tok_attn.pen_proj(tok_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
+        self.sys_attn.cache_pen.copy_(F.pad(self.sys_attn.pen_proj(sys_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
 
         # ── Step 5: inhibitory output ──────────────────────────────────────────
         tok_out = tok - self.tok_attn.out_proj(tok_bottleneck)
