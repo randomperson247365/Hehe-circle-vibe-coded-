@@ -66,22 +66,25 @@ class FlyAttention(nn.Module):
         # XLA treats the 16 dim as a hard batch wall — mathematically identical
         # to 16 separate Linear layers but eliminates 16-node HLO graph bloat
         # Mobile export: weights.unbind(0) → 16 separate tensors for NPU inference
-        self.streams_weight = nn.Parameter(
-            torch.stack([
-                torch.nn.init.orthogonal_(torch.empty(self.stream_dim, self.stream_dim))
-                for _ in range(config.n_streams)
-            ])
-        )  # (n_streams, stream_dim, stream_dim)
+        # xavier_uniform_ instead of orthogonal_ — safer in bfloat16
+        streams_blocks = [
+            torch.empty(self.stream_dim, self.stream_dim)
+            for _ in range(config.n_streams)
+        ]
+        for b in streams_blocks:
+            nn.init.xavier_uniform_(b)
+        self.streams_weight = nn.Parameter(torch.stack(streams_blocks))
         self._cuda_streams = None  # lazy init for GPU parallel dispatch
 
         # ── Portal / BU-LAL — stacked for TPU BatchMatMul ────────────────────────
         # Same treatment: (4, 192, 192) weight tensor → one torch.matmul
-        self.portal_weight = nn.Parameter(
-            torch.stack([
-                torch.nn.init.orthogonal_(torch.empty(self.portal_dim, self.portal_dim))
-                for _ in range(config.portal_heads)
-            ])
-        )  # (portal_heads, portal_dim, portal_dim)
+        portal_blocks = [
+            torch.empty(self.portal_dim, self.portal_dim)
+            for _ in range(config.portal_heads)
+        ]
+        for b in portal_blocks:
+            nn.init.xavier_uniform_(b)
+        self.portal_weight = nn.Parameter(torch.stack(portal_blocks))
         self._portal_cuda_streams = None
         self.portal_norm = nn.LayerNorm(config.d_model)
 
@@ -95,13 +98,17 @@ class FlyAttention(nn.Module):
         self.register_buffer('delta7_mask', mask)
 
         # ── E-PG projection: bottleneck → stream bias ─────────────────────────────
+        # small init — cache starts at zero, default kaiming init causes bfloat16 overflow
         self.epg_proj = nn.Linear(config.n_bottleneck, config.d_model, bias=False)
+        nn.init.normal_(self.epg_proj.weight, std=0.01)
 
         # ── P-EN projection: streams → bottleneck bias ────────────────────────────
         self.pen_proj = nn.Linear(config.d_model, config.n_bottleneck, bias=False)
+        nn.init.normal_(self.pen_proj.weight, std=0.01)
 
         # ── Output projection ──────────────────────────────────────────────────────
         self.out_proj = nn.Linear(config.n_bottleneck, config.d_model, bias=False)
+        nn.init.normal_(self.out_proj.weight, std=0.01)
 
         # ── Cache — padded to 128 for TPU HBM alignment ───────────────────────────
         # Biologically: 8 Δ7 neurons. Physically: (128,) for TPU vector alignment.
@@ -354,15 +361,18 @@ class InterPortal(nn.Module):
 
         # stacked (n_streams, n_streams, d_model, d_model)
         # diagonal (i==j) zeroed — no self-interaction
-        raw = torch.stack([
-            torch.stack([
-                torch.nn.init.orthogonal_(torch.empty(d_model, d_model)) if i != j
-                else torch.zeros(d_model, d_model)
-                for j in range(n_streams)
-            ])
-            for i in range(n_streams)
-        ])
-        self.bias_weights = nn.Parameter(raw)
+        raw_weights = []
+        for i in range(n_streams):
+            row = []
+            for j in range(n_streams):
+                if i != j:
+                    w = torch.empty(d_model, d_model)
+                    nn.init.xavier_uniform_(w)
+                    row.append(w)
+                else:
+                    row.append(torch.zeros(d_model, d_model))
+            raw_weights.append(torch.stack(row))
+        self.bias_weights = nn.Parameter(torch.stack(raw_weights))
 
     def forward(self, stream_outs: list[torch.Tensor]) -> list[torch.Tensor]:
         """
