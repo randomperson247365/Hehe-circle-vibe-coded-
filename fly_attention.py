@@ -295,12 +295,20 @@ class FlyAttention(nn.Module):
         bottleneck_var = bottleneck.var(dim=(0, 1)).mean()
         loss_coherence = -bottleneck_var.clamp(max=1.0)
 
+        # 6. Overflow forcefield — exponential penalty approaching clamp boundary
+        # pow(4) means small values ≈ 0, values near 1e4 trigger massive gradient
+        # teaches the model to self-regulate variance below the clamp
+        # preserves cache linear relationships — clamp flattening ruins them
+        max_val = 1e4
+        loss_overflow = (bottleneck.abs() / max_val).pow(4).mean()
+
         return {
             'fly_inhibitory': loss_inhibitory * 0.01,
             'fly_stability':  loss_stability  * 0.01,
             'fly_sparse':     loss_sparse     * 0.001,
             'fly_reformat':   loss_reformat   * 0.01,
             'fly_coherence':  loss_coherence  * 0.01,
+            'fly_overflow':   loss_overflow   * 0.05,
         }
 
     def param_count(self) -> dict[str, int]:
