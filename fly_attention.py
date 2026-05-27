@@ -126,9 +126,15 @@ class FlyAttention(nn.Module):
         B, T, D = x.shape
         nb = self.cfg.n_bottleneck
 
+        # strip autograd history from cache at start of each forward
+        # ensures Step N backward can't leak into Step N+1 graph
+        if self.training:
+            self.cache_epg.detach_()
+            self.cache_pen.detach_()
+
         # ── Step 1: Parallel streams — single BatchMatMul ─────────────────────
         # EPG cache bias: only use first nb slots, rest is padding
-        epg_bias = self.epg_proj(self.cache_epg[:nb].clone())  # .clone() breaks version tracking from copy_()
+        epg_bias = self.epg_proj(self.cache_epg[:nb].detach().clone())
         x_biased = x + epg_bias.unsqueeze(0).unsqueeze(0)
 
         # reshape for batched matmul: (B, T, d_model) → (B, n_streams, T, stream_dim)
@@ -168,7 +174,7 @@ class FlyAttention(nn.Module):
         # Apply sparse mask functionally — avoids .data mutation mid-forward
         # which causes XLA to halt and recompile the graph
         masked_delta7 = self.delta7.weight * self.delta7_mask
-        bottleneck = F.linear(portal_out, masked_delta7) + self.cache_pen[:nb].clone().unsqueeze(0).unsqueeze(0)
+        bottleneck = F.linear(portal_out, masked_delta7) + self.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
 
         # ── Step 4: Cache update — in-graph, no host sync ─────────────────────
         # Keep entirely on device — XLA treats as device memory copy, no sync
@@ -193,7 +199,28 @@ class FlyAttention(nn.Module):
 
         return out
 
+    def detach_caches(self):
+        """Sever cache graph history between training steps.
+        Call after backward() to prevent autograd from backpropping
+        through cached state across steps. Cache values are preserved
+        but detached from the computation graph.
+        """
+        self.cache_epg.detach_()
+        self.cache_pen.detach_()
+
     def compute_aux_losses(self) -> dict[str, torch.Tensor]:
+        """
+        Compute purpose-enforcement losses from last forward pass.
+        Call after forward() during training.
+
+        Does NOT require passing intermediates — they're stored on self.
+        """
+        return self.auxiliary_losses(
+            x=self._last_x,
+            bottleneck=self._last_bottleneck,
+            inhibition=self._last_inhibition,
+            cache_prev=self._last_cache_prev,
+        )
         """
         Compute purpose-enforcement losses from last forward pass.
         Call after forward() during training.
@@ -395,9 +422,16 @@ class FlyAttentionPair(nn.Module):
         portal_heads = self.tok_attn.cfg.portal_heads
         portal_dim = self.tok_attn.portal_dim
 
+        # strip autograd history from caches at start of forward
+        if self.training:
+            self.tok_attn.cache_epg.detach_()
+            self.tok_attn.cache_pen.detach_()
+            self.sys_attn.cache_epg.detach_()
+            self.sys_attn.cache_pen.detach_()
+
         # ── Step 1: parallel streams — single BatchMatMul each ────────────────
-        tok_epg_bias = self.tok_attn.epg_proj(self.tok_attn.cache_epg[:nb].clone())
-        sys_epg_bias = self.sys_attn.epg_proj(self.sys_attn.cache_epg[:nb].clone())
+        tok_epg_bias = self.tok_attn.epg_proj(self.tok_attn.cache_epg[:nb].detach().clone())
+        sys_epg_bias = self.sys_attn.epg_proj(self.sys_attn.cache_epg[:nb].detach().clone())
 
         tok_biased = tok + tok_epg_bias.unsqueeze(0).unsqueeze(0)
         sys_biased = sys + sys_epg_bias.unsqueeze(0).unsqueeze(0)
@@ -442,9 +476,9 @@ class FlyAttentionPair(nn.Module):
         masked_sys_d7 = self.sys_attn.delta7.weight * self.sys_attn.delta7_mask
 
         tok_bottleneck = F.linear(tok_portal_out, masked_tok_d7) + \
-                         self.tok_attn.cache_pen[:nb].clone().unsqueeze(0).unsqueeze(0)
+                         self.tok_attn.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
         sys_bottleneck = F.linear(sys_portal_out, masked_sys_d7) + \
-                         self.sys_attn.cache_pen[:nb].clone().unsqueeze(0).unsqueeze(0)
+                         self.sys_attn.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
 
         # in-place .copy_() + detach — stays on device, no graph break, no autograd conflict
         self.tok_attn.cache_epg.copy_(F.pad(tok_bottleneck.detach().mean(dim=(0,1)), (0, pad-nb)))
