@@ -50,6 +50,10 @@ class FlyAttentionConfig:
                                # configurable: larger = more working memory capacity
     sparsity: float = 0.5     # fraction of Δ7 weights zeroed (biological sparse connectivity)
     portal_heads: int = 4     # topographic portal — how many parallel channels in BU/LAL
+    bcn_momentum: float = 0.9 # EMA momentum for cache update (0.0=hard replace, 0.9=slow decay)
+                               # higher = cache holds information longer across steps
+                               # biological analogy: dopaminergic gating — synapses strengthen
+                               # proportionally to prediction error, not average state
 
 
 
@@ -205,17 +209,22 @@ class FlyAttention(nn.Module):
         masked_bcn = self.bcn_compress.weight * self.bcn_mask
         bottleneck = F.linear(portal_out, masked_bcn) + self.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
 
-        # ── Step 4: Cache update — in-graph, no host sync ─────────────────────
-        # Keep entirely on device — XLA treats as device memory copy, no sync
-        # Pad mean from (nb,) to (128,) for TPU HBM alignment
-        # detach() intentional — gradients don't flow through cache across steps
+        # ── Step 4: Cache update — EMA with momentum ──────────────────────────
+        # EMA instead of hard mean — lets transient peaks persist rather than
+        # being flattened immediately. Biological analogy: dopaminergic gating,
+        # synapses strengthen proportionally to prediction error, not average state.
+        # momentum=0.0 → hard replace (old behavior)
+        # momentum=0.9 → slow EMA, holds information longer
         cache_prev = self.cache_epg.detach().clone()
 
         raw_epg = bottleneck.detach().mean(dim=(0, 1)).clamp(-1e4, 1e4)
-        self.cache_epg.copy_(F.pad(raw_epg, (0, self._cache_pad - nb)))
+        new_epg  = F.pad(raw_epg, (0, self._cache_pad - nb))
+        m = self.cfg.bcn_momentum
+        self.cache_epg.copy_(m * self.cache_epg + (1 - m) * new_epg)
 
-        raw_pen = self.bcn_read(portal_out.detach().mean(dim=(0, 1))).clamp(-1e4, 1e4)
-        self.cache_pen.copy_(F.pad(raw_pen, (0, self._cache_pad - nb)))
+        raw_pen  = self.bcn_read(portal_out.detach().mean(dim=(0, 1))).clamp(-1e4, 1e4)
+        new_pen  = F.pad(raw_pen, (0, self._cache_pad - nb))
+        self.cache_pen.copy_(m * self.cache_pen + (1 - m) * new_pen)
 
         # ── Step 5: Inhibitory output ─────────────────────────────────────────
         inhibition = self.bcn_out(bottleneck)
@@ -326,13 +335,36 @@ class FlyAttention(nn.Module):
         loss_overflow = (bottleneck.abs() / max_val).pow(4).mean()
 
         return {
-            'fly_inhibitory': loss_inhibitory * 0.01,
-            'fly_stability':  loss_stability  * 0.01,
-            'fly_sparse':     loss_sparse     * 0.001,
-            'fly_reformat':   loss_reformat   * 0.01,
-            'fly_coherence':  loss_coherence  * 0.01,
-            'fly_overflow':   loss_overflow   * 0.05,
+            # weights reduced — functional guidance only, not hard enforcement
+            # model goals should dominate, these just nudge toward good structure
+            'fly_inhibitory': loss_inhibitory * 0.001,
+            'fly_stability':  loss_stability  * 0.001,
+            'fly_sparse':     loss_sparse     * 0.0001,
+            'fly_reformat':   loss_reformat   * 0.001,
+            'fly_coherence':  loss_coherence  * 0.001,
+            'fly_overflow':   loss_overflow   * 0.01,
         }
+
+    def register_sparse_backprop(self):
+        """
+        Register gradient hooks to apply sparse backprop on bcn_compress.
+        Only the active connections (bcn_mask=1) receive gradient updates.
+        Inactive connections are frozen — prevents catastrophic forgetting
+        of structure learned through sparse connectivity.
+
+        Call once after model creation:
+            for m in model.modules():
+                if isinstance(m, FlyAttention):
+                    m.register_sparse_backprop()
+        """
+        mask = self.bcn_mask  # (bcn_size, d_model)
+
+        def _sparse_grad_hook(grad):
+            # zero out gradients for masked (inactive) connections
+            # only active connections update — catastrophic forgetting prevention
+            return grad * mask
+
+        self.bcn_compress.weight.register_hook(_sparse_grad_hook)
 
     def param_count(self) -> dict[str, int]:
         """Breakdown of parameter counts per component."""
@@ -528,11 +560,12 @@ class FlyAttentionPair(nn.Module):
         sys_bottleneck = F.linear(sys_portal_out, masked_sys_bcn) + \
                          self.sys_attn.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
 
-        # in-place .copy_() + detach — stays on device, no graph break, no autograd conflict
-        self.tok_attn.cache_epg.copy_(F.pad(tok_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
-        self.sys_attn.cache_epg.copy_(F.pad(sys_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
-        self.tok_attn.cache_pen.copy_(F.pad(self.tok_attn.bcn_read(tok_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
-        self.sys_attn.cache_pen.copy_(F.pad(self.sys_attn.bcn_read(sys_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
+        # EMA cache update — momentum prevents hard mean from flattening transient KV associations
+        m   = self.tok_attn.cfg.bcn_momentum
+        self.tok_attn.cache_epg.copy_(m * self.tok_attn.cache_epg + (1-m) * F.pad(tok_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
+        self.sys_attn.cache_epg.copy_(m * self.sys_attn.cache_epg + (1-m) * F.pad(sys_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
+        self.tok_attn.cache_pen.copy_(m * self.tok_attn.cache_pen + (1-m) * F.pad(self.tok_attn.bcn_read(tok_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
+        self.sys_attn.cache_pen.copy_(m * self.sys_attn.cache_pen + (1-m) * F.pad(self.sys_attn.bcn_read(sys_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
 
         # ── Step 5: inhibitory output ──────────────────────────────────────────
         tok_out = tok - self.tok_attn.bcn_out(tok_bottleneck)
