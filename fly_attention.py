@@ -7,19 +7,19 @@ Based on Drosophila central complex connectome structure:
        ↓
   Portal / BU-LAL equivalent         — FIRST cross-stream convergence point
        ↓                               topographic, not fully mixed
-  Δ7 bottleneck interneurons         — sparse, inhibitory, compress to 8 values
+  Bias Cachneck (Δ7)         — sparse, inhibitory, compress to 8 values
        ↓          ↑
   Cache (E-PG / P-EN reciprocal)     — inter-pass feedback, held across denoising steps
        ↓                               residual history accumulates naturally
   Output — inhibitory subtraction    — suppress established signal, pass novel
 
 Inter-layer connection:
-  Each FlyAttention layer has its OWN portal and Δ7 bottleneck.
+  Each FlyAttention layer has its OWN portal and bias cachneck.
   Layers connect ONLY through the cache:
-    Layer N: streams → portal_N → Δ7 → cache_N
-    Layer N+1: streams(+cache_N bias) → portal_N+1 → Δ7 → cache_N+1
+    Layer N: streams → portal_N → bcn → cache_N
+    Layer N+1: streams(+cache_N bias) → portal_N+1 → bcn → cache_N+1
 
-Streams NEVER talk to each other directly — only portal → Δ7 → cache → next layer.
+Streams NEVER talk to each other directly — only portal → bcn → cache → next layer.
 
 Complexity: O(n) in sequence length — no O(n²) anywhere.
 Parameters: ~38x fewer than standard attention at d=768.
@@ -36,7 +36,8 @@ from dataclasses import dataclass
 class FlyAttentionConfig:
     d_model: int = 768
     n_streams: int = 16       # PB columns — must divide d_model
-    n_bottleneck: int = 8     # Δ7 interneurons
+    bcn_size: int = 8         # bias cachneck size (Δ7 channel width)
+                               # configurable: larger = more working memory capacity
     sparsity: float = 0.5     # fraction of Δ7 weights zeroed (biological sparse connectivity)
     portal_heads: int = 4     # topographic portal — how many parallel channels in BU/LAL
 
@@ -45,7 +46,7 @@ class FlyAttentionConfig:
 class FlyAttention(nn.Module):
     """
     Single FlyAttention layer — drop-in attention replacement.
-    Each layer has its own portal and Δ7 bottleneck.
+    Each layer has its own portal and bias cachneck.
     Layers communicate only through the cache.
     """
 
@@ -88,31 +89,40 @@ class FlyAttention(nn.Module):
         self._portal_cuda_streams = None
         self.portal_norm = nn.LayerNorm(config.d_model)
 
-        # ── Δ7 bottleneck (sparse inhibitory interneurons) ────────────────────────
-        self.delta7 = nn.Linear(config.d_model, config.n_bottleneck, bias=False)
-        mask = torch.zeros(config.n_bottleneck, config.d_model)
+        # ── Bias Cachneck (bcn_*) ─────────────────────────────────────────────────────
+        # Named bcn_* (not bottleneck_*) to clarify: this is NOT a data bottleneck.
+        # The main representation NEVER passes through here — it flows uncompressed above.
+        # This is a side channel: reads activations → compresses to cache size → stores →
+        # biases the NEXT pass via bcn_expand. The layer above is only biased, not compressed.
+        #
+        # Biologically: Δ7 interneurons in the Drosophila protocerebral bridge.
+        # 8 neuron types (bcn_size=8 default), ~50% sparse connectivity.
+        # They don't bottleneck the PB columns — they run alongside them as inhibitory
+        # modulators, compressing population activity into a compact attractor state.
+        self.bcn_compress = nn.Linear(config.d_model, config.bcn_size, bias=False)
+        mask = torch.zeros(config.bcn_size, config.d_model)
         n_connections = int(config.d_model * (1.0 - config.sparsity))
-        for i in range(config.n_bottleneck):
+        for i in range(config.bcn_size):
             idx = torch.randperm(config.d_model)[:n_connections]
             mask[i, idx] = 1.0
-        self.register_buffer('delta7_mask', mask)
+        self.register_buffer('bcn_mask', mask)
 
-        # ── E-PG projection: bottleneck → stream bias ─────────────────────────────
+        # ── bcn_expand: bias cachneck → d_model (E-PG) ──────────────────────────────
         # small init — cache starts at zero, default kaiming init causes bfloat16 overflow
-        self.epg_proj = nn.Linear(config.n_bottleneck, config.d_model, bias=False)
-        nn.init.normal_(self.epg_proj.weight, std=0.01)
+        self.bcn_expand = nn.Linear(config.bcn_size, config.d_model, bias=False)
+        nn.init.normal_(self.bcn_expand.weight, std=0.01)
 
-        # ── P-EN projection: streams → bottleneck bias ────────────────────────────
-        self.pen_proj = nn.Linear(config.d_model, config.n_bottleneck, bias=False)
-        nn.init.normal_(self.pen_proj.weight, std=0.01)
+        # ── bcn_read: d_model → bias cachneck (P-EN) ────────────────────────────────
+        self.bcn_read = nn.Linear(config.d_model, config.bcn_size, bias=False)
+        nn.init.normal_(self.bcn_read.weight, std=0.01)
 
         # ── Output projection ──────────────────────────────────────────────────────
-        self.out_proj = nn.Linear(config.n_bottleneck, config.d_model, bias=False)
-        nn.init.normal_(self.out_proj.weight, std=0.01)
+        self.bcn_out = nn.Linear(config.bcn_size, config.d_model, bias=False)
+        nn.init.normal_(self.bcn_out.weight, std=0.01)
 
         # ── Cache — padded to 128 for TPU HBM alignment ───────────────────────────
         # Biologically: 8 Δ7 neurons. Physically: (128,) for TPU vector alignment.
-        # Only first n_bottleneck slots are used — rest are zero padding.
+        # Only first bcn_size slots used — rest is zero padding.
         # Stays on-device between steps — no host sync, no Python-land leak.
         # Updated via in-graph mean() — XLA handles as device memory copy.
         _cache_pad = 128  # TPU vector register alignment
@@ -131,7 +141,7 @@ class FlyAttention(nn.Module):
         self._last_cache_prev are available for auxiliary_losses().
         """
         B, T, D = x.shape
-        nb = self.cfg.n_bottleneck
+        nb = self.cfg.bcn_size
 
         # strip autograd history from cache at start of each forward
         # ensures Step N backward can't leak into Step N+1 graph
@@ -141,7 +151,7 @@ class FlyAttention(nn.Module):
 
         # ── Step 1: Parallel streams — single BatchMatMul ─────────────────────
         # EPG cache bias: only use first nb slots, rest is padding
-        epg_bias = self.epg_proj(self.cache_epg[:nb].detach().clone())
+        epg_bias = self.bcn_expand(self.cache_epg[:nb].detach().clone())
         x_biased = x + epg_bias.unsqueeze(0).unsqueeze(0)
 
         # reshape for batched matmul: (B, T, d_model) → (B, n_streams, T, stream_dim)
@@ -179,11 +189,11 @@ class FlyAttention(nn.Module):
         # clamp to bfloat16 safe range — gradient still flows, model learns to stay in range
         portal_out = portal_out.clamp(-1e4, 1e4)
 
-        # ── Step 3: Δ7 bottleneck ─────────────────────────────────────────────
+        # ── Step 3: bias cachneck ─────────────────────────────────────────────
         # Apply sparse mask functionally — avoids .data mutation mid-forward
         # which causes XLA to halt and recompile the graph
-        masked_delta7 = self.delta7.weight * self.delta7_mask
-        bottleneck = F.linear(portal_out, masked_delta7) + self.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
+        masked_bcn = self.bcn_compress.weight * self.bcn_mask
+        bottleneck = F.linear(portal_out, masked_bcn) + self.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
 
         # ── Step 4: Cache update — in-graph, no host sync ─────────────────────
         # Keep entirely on device — XLA treats as device memory copy, no sync
@@ -194,11 +204,11 @@ class FlyAttention(nn.Module):
         raw_epg = bottleneck.detach().mean(dim=(0, 1)).clamp(-1e4, 1e4)
         self.cache_epg.copy_(F.pad(raw_epg, (0, self._cache_pad - nb)))
 
-        raw_pen = self.pen_proj(portal_out.detach().mean(dim=(0, 1))).clamp(-1e4, 1e4)
+        raw_pen = self.bcn_read(portal_out.detach().mean(dim=(0, 1))).clamp(-1e4, 1e4)
         self.cache_pen.copy_(F.pad(raw_pen, (0, self._cache_pad - nb)))
 
         # ── Step 5: Inhibitory output ─────────────────────────────────────────
-        inhibition = self.out_proj(bottleneck)
+        inhibition = self.bcn_out(bottleneck)
         out = x - inhibition
 
         self._last_bottleneck = bottleneck
@@ -272,14 +282,14 @@ class FlyAttention(nn.Module):
 
         # 2. Stability — cache should be a stable attractor, not wild oscillation
         # compare only active nb slots — rest is TPU alignment padding
-        nb = self.cfg.n_bottleneck
+        nb = self.cfg.bcn_size
         loss_stability = F.mse_loss(
             self.cache_epg[:nb],
             cache_prev[:nb].detach()
         )
 
         # 3. Sparsity — maintain biological sparse connectivity
-        loss_sparse = self.delta7.weight.abs().mean()
+        loss_sparse = self.bcn_compress.weight.abs().mean()
 
         # 4. Reformat — bottleneck must change representation, not just scale it
         # Compare bottleneck (B,T,8) to x (B,T,768) via mean pooling x to match
@@ -319,10 +329,10 @@ class FlyAttention(nn.Module):
         return {
             'streams':      self.streams_weight.numel(),
             'portal':       self.portal_weight.numel(),
-            'delta7':       self.delta7.weight.numel(),
-            'epg_proj':     self.epg_proj.weight.numel(),
-            'pen_proj':     self.pen_proj.weight.numel(),
-            'out_proj':     self.out_proj.weight.numel(),
+            'bcn_compress':       self.bcn_compress.weight.numel(),
+            'bcn_expand':   self.bcn_expand.weight.numel(),
+            'bcn_read':     self.bcn_read.weight.numel(),
+            'bcn_out':      self.bcn_out.weight.numel(),
             'portal_norm':  sum(p.numel() for p in self.portal_norm.parameters()),
         }
 
@@ -442,7 +452,7 @@ class FlyAttentionPair(nn.Module):
         """
         B_tok, T_tok, D = tok.shape
         B_sys, T_sys, _  = sys.shape
-        nb = self.tok_attn.cfg.n_bottleneck
+        nb = self.tok_attn.cfg.bcn_size
         n_streams = self.tok_attn.cfg.n_streams
         stream_dim = self.tok_attn.stream_dim
         portal_heads = self.tok_attn.cfg.portal_heads
@@ -456,8 +466,8 @@ class FlyAttentionPair(nn.Module):
             self.sys_attn.cache_pen.detach_()
 
         # ── Step 1: parallel streams — single BatchMatMul each ────────────────
-        tok_epg_bias = self.tok_attn.epg_proj(self.tok_attn.cache_epg[:nb].detach().clone())
-        sys_epg_bias = self.sys_attn.epg_proj(self.sys_attn.cache_epg[:nb].detach().clone())
+        tok_epg_bias = self.tok_attn.bcn_expand(self.tok_attn.cache_epg[:nb].detach().clone())
+        sys_epg_bias = self.sys_attn.bcn_expand(self.sys_attn.cache_epg[:nb].detach().clone())
 
         tok_biased = tok + tok_epg_bias.unsqueeze(0).unsqueeze(0)
         sys_biased = sys + sys_epg_bias.unsqueeze(0).unsqueeze(0)
@@ -497,25 +507,25 @@ class FlyAttentionPair(nn.Module):
             torch.matmul(sys_p, self.sys_attn.portal_weight).permute(0,2,1,3).contiguous().view(B_sys, T_sys, D))
         sys_portal_out = sys_portal_out.clamp(-1e4, 1e4)
 
-        # ── Step 4: Δ7 bottleneck + cache update — in-graph, no host sync ────
+        # ── Step 4: bias cachneck + cache update — in-graph, no host sync ────
         # Apply sparse mask functionally — no .data mutation mid-forward
         pad = self.tok_attn._cache_pad
-        masked_tok_d7 = self.tok_attn.delta7.weight * self.tok_attn.delta7_mask
-        masked_sys_d7 = self.sys_attn.delta7.weight * self.sys_attn.delta7_mask
+        masked_tok_bcn = self.tok_attn.bcn_compress.weight * self.tok_attn.bcn_mask
+        masked_sys_bcn = self.sys_attn.bcn_compress.weight * self.sys_attn.bcn_mask
 
-        tok_bottleneck = F.linear(tok_portal_out, masked_tok_d7) + \
+        tok_bottleneck = F.linear(tok_portal_out, masked_tok_bcn) + \
                          self.tok_attn.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
-        sys_bottleneck = F.linear(sys_portal_out, masked_sys_d7) + \
+        sys_bottleneck = F.linear(sys_portal_out, masked_sys_bcn) + \
                          self.sys_attn.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
 
         # in-place .copy_() + detach — stays on device, no graph break, no autograd conflict
         self.tok_attn.cache_epg.copy_(F.pad(tok_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
         self.sys_attn.cache_epg.copy_(F.pad(sys_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
-        self.tok_attn.cache_pen.copy_(F.pad(self.tok_attn.pen_proj(tok_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
-        self.sys_attn.cache_pen.copy_(F.pad(self.sys_attn.pen_proj(sys_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
+        self.tok_attn.cache_pen.copy_(F.pad(self.tok_attn.bcn_read(tok_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
+        self.sys_attn.cache_pen.copy_(F.pad(self.sys_attn.bcn_read(sys_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
 
         # ── Step 5: inhibitory output ──────────────────────────────────────────
-        tok_out = tok - self.tok_attn.out_proj(tok_bottleneck)
-        sys_out = sys - self.sys_attn.out_proj(sys_bottleneck)
+        tok_out = tok - self.tok_attn.bcn_out(tok_bottleneck)
+        sys_out = sys - self.sys_attn.bcn_out(sys_bottleneck)
 
         return tok_out, sys_out
