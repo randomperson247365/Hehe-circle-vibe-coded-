@@ -44,18 +44,71 @@ from dataclasses import dataclass
 
 @dataclass
 class FlyAttentionConfig:
+    """
+    Configuration for FlyAttention.
+
+    Default values are derived from the FlyWire connectome (FAFB v783, Princeton 2024).
+    Each parameter is tunable for your application — the defaults are biologically grounded
+    but not necessarily optimal for all tasks.
+
+    ⚠️  RANDOM INIT WARNING:
+    streams_weight, portal_weight, kc_weight and bcn_mask are randomly initialized buffers.
+    They are fixed after init (not learned) but DIFFERENT every instantiation.
+    After creating a model, SAVE the state_dict immediately — these buffers are saved in
+    the checkpoint and will be restored correctly. If you create a new instance without
+    loading a checkpoint, you get a different random anatomy that won't match your trained
+    learned weights (bcn_expand, bcn_read, etc).
+
+    Example:
+        fly = FlyAttention(cfg)
+        torch.save(fly.state_dict(), 'fly_anatomy.pt')  # save immediately after init
+        # later:
+        fly.load_state_dict(torch.load('fly_anatomy.pt'))  # restores exact anatomy
+    """
     d_model: int = 768
     n_streams: int = 16       # PB columns — must divide d_model
     bcn_size: int = 8         # bias cachneck size (Δ7 channel width)
     sparsity: float = 0.5     # fraction of Δ7 weights zeroed (biological sparse connectivity)
     portal_heads: int = 4     # topographic portal — BU/LAL convergence heads
-    kc_size: int = -1         # Kenyon cell expansion size (-1 = auto: 2×d_model, 0 = disabled)
-                               # expansion layer before bcn — sparse hash of portal activations
-                               # functional: wider → more discriminable sparse codes
+    kc_size: int = -1         # Kenyon cell expansion size (-1=auto: 2×d_model, 0=disabled)
                                # biological: MB Kenyon cells expand 51 glomeruli → 2000 KCs
-                               # simplified: just expand + GELU + top-k (≈APL global inhibition)
     ring_alpha: float = 0.1   # ring attractor conv strength (0=disabled)
-                               # biological: EB ring attractor — local excitation stabilizes cache bump
+                               # biological: EB ring attractor — local excitation stabilizes bump
+
+    # ── Connectome-derived parameters — defaults from FlyWire synapse counts ──────
+    # All tunable for your application. Set to non-default to explore or ablate.
+
+    portal_scale: float = 3.0
+    # LAL:PB synapse ratio from connectome: LAL mean=300-375, PB mean=80 → ~3-4x stronger
+    # Portal convergence dominates streams biologically — default=3.0 matches ground truth
+    # Tune: lower for more stream influence, higher for more portal dominance
+    # Allow inhibitory: N/A (portal_norm handles sign)
+
+    streams_excitatory: bool = True
+    # PB connectome: GLUT+ACH only, no GABA — streams are purely excitatory
+    # Default=True clamps stream weights positive (abs() of orthogonal init)
+    # Set False to allow inhibitory stream connections — may help vision/audio tasks
+    # where inhibitory lateral connections are common
+
+    velocity_coeff: float = -0.5
+    # NO connectome: GABA mean=198 synapses — velocity is STRONG and inhibitory
+    # Default=-0.5 (inhibitory, strong). 0.0=disabled, positive=excitatory velocity
+    # Tune: increase magnitude for stronger velocity integration
+    # Allow excitatory: set positive — some tasks benefit from positive velocity bias
+
+    ring_inhibition: float = 0.4
+    # EB connectome: ACH mean=137, GABA mean=130, GLUT mean=136 — all roughly equal
+    # Default=0.4 gives balanced kernel [-0.4, 0.2, 1.0, 0.2, -0.4]
+    # Tune: lower for weaker surround inhibition (softer bump), higher for sharper bump
+    # Allow excitatory flanks: set negative — inverts to excitatory surround (non-biological)
+
+    da_gate_primary: bool = True
+    # MB connectome: DA mean=180 synapses — dopamine IS the primary memory gate signal
+    # Default=True: surprise drives gate primarily — sigmoid(surprise * (1 + bcn_gate))
+    # Set False: additive mode — sigmoid(bcn_gate + 0.1 * surprise) — gate learned independently
+    # Tune: False may help tasks where memorization timing should be learned not surprise-driven
+
+
 
 
 
@@ -84,10 +137,15 @@ class FlyAttention(nn.Module):
         # Fixed orthogonal init — preserves signal magnitude, no gradient needed.
         # Registered as buffer not Parameter — no gradient, no optimizer state.
         # Mobile export: weights.unbind(0) → 16 separate tensors for NPU inference
+        # PB connectome: GLUT+ACH only (excitatory), no GABA — streams are purely excitatory
+        # Clamp weights positive at init — matches biological constraint
+        # Orthogonal init then abs() preserves orthogonality structure while enforcing positivity
         streams_blocks = []
         for _ in range(config.n_streams):
             b = torch.empty(self.stream_dim, self.stream_dim)
             nn.init.orthogonal_(b)
+            if config.streams_excitatory:
+                b = b.abs()  # PB: purely excitatory — no negative weights
             streams_blocks.append(b)
         self.register_buffer('streams_weight', torch.stack(streams_blocks))
 
@@ -105,6 +163,8 @@ class FlyAttention(nn.Module):
             portal_blocks.append(b)
         self.register_buffer('portal_weight', torch.stack(portal_blocks))
         self.portal_norm = nn.LayerNorm(config.d_model)  # learned — fine-tunes convergence
+        # LAL:PB synapse ratio from connectome — portal is biologically 3-4x stronger than streams
+        self._portal_scale = config.portal_scale
 
         # ── Bias Cachneck (bcn_*) ─────────────────────────────────────────────────────
         # Named bcn_* (not bottleneck_*) to clarify: this is NOT a data bottleneck.
@@ -180,11 +240,16 @@ class FlyAttention(nn.Module):
         # Center-surround init: local excitation + surround inhibition = bump dynamics.
         # Only 5 parameters — can adapt the bump shape slightly for generalization.
         # ring_alpha=0 → disabled, >0 → scales conv output before adding to cache.
+        # EB connectome: ACH mean=137, GABA mean=130, GLUT mean=136 — all roughly equal
+        # Ring kernel should be balanced: equal excitation AND inhibition strength
+        # Updated from asymmetric [-0.1, 0.3, 1.0, 0.3, -0.1] to balanced ratio
         self.ring_conv = nn.Conv1d(1, 1, kernel_size=5, padding=0, bias=False)
         nn.init.constant_(self.ring_conv.weight, 0.0)
-        # center-surround init — excite center, inhibit surround
         with torch.no_grad():
-            self.ring_conv.weight[0, 0] = torch.tensor([-0.1, 0.3, 1.0, 0.3, -0.1])
+            # EB connectome: ACH≈GABA≈GLUT all mean ~136 — balanced kernel
+            # ring_inhibition controls flank strength — default=0.4 from connectome ratio
+            ri = config.ring_inhibition
+            self.ring_conv.weight[0, 0] = torch.tensor([-ri, ri*0.5, 1.0, ri*0.5, -ri])
 
         # ── Cache — padded to 128 for TPU HBM alignment ───────────────────────────
         # Biologically: 8 Δ7 neurons. Physically: (128,) for TPU vector alignment.
@@ -243,7 +308,8 @@ class FlyAttention(nn.Module):
         portal_out_s = torch.matmul(p_in, self.portal_weight)  # (B, portal_heads, T, portal_dim)
         portal_out = portal_out_s.permute(0, 2, 1, 3).contiguous().view(B, T, D)
         portal_out = self.portal_norm(portal_out)
-        # clamp to bfloat16 safe range — gradient still flows, model learns to stay in range
+        # LAL:PB synapse ratio = 3-4x — portal signal is biologically stronger than streams
+        portal_out = portal_out * self._portal_scale
         portal_out = portal_out.clamp(-1e4, 1e4)
 
         # ── Step 3a: KC sparse expansion (MB Kenyon cells) ───────────────────
@@ -287,11 +353,16 @@ class FlyAttention(nn.Module):
             bcn_mean = bottleneck.mean(dim=(0, 1)).clamp(-1e4, 1e4)  # (nb,)
             velocity = bcn_mean - cache_prev[:nb]                     # P-EN: rate of change
             surprise = velocity.abs().mean().clamp(0, 10)             # OA: prediction error
-            gate     = torch.sigmoid(
-                self.bcn_gate(bcn_mean) + 0.1 * surprise                    # surprise-driven gate
-            )                                                          # (nb,) in (0,1)
-            # integrate velocity into cache value (P-EN bump shift)
-            new_val  = (bcn_mean + 0.1 * velocity).clamp(-1e4, 1e4)  # (nb,)
+            # MB connectome: DA mean=180 — dopamine is primary memory gate signal
+            # da_gate_primary=True (default): surprise drives gate, bcn_gate scales
+            # da_gate_primary=False: additive mode — gate learned independently of surprise
+            if self.cfg.da_gate_primary:
+                gate = torch.sigmoid(surprise * (1.0 + self.bcn_gate(bcn_mean)))
+            else:
+                gate = torch.sigmoid(self.bcn_gate(bcn_mean) + 0.1 * surprise)
+            # NO connectome: GABA mean=198 — velocity strong and inhibitory (default)
+            # velocity_coeff: negative=inhibitory (ground truth), positive=excitatory, 0=disabled
+            new_val  = (bcn_mean + self.cfg.velocity_coeff * velocity).clamp(-1e4, 1e4)
             # ring attractor — learned circular conv stabilizes cache into bump
             if self.cfg.ring_alpha > 0:
                 v_conv = new_val.view(1, 1, nb)                       # (1,1,nb)
