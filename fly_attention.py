@@ -47,13 +47,15 @@ class FlyAttentionConfig:
     d_model: int = 768
     n_streams: int = 16       # PB columns — must divide d_model
     bcn_size: int = 8         # bias cachneck size (Δ7 channel width)
-                               # configurable: larger = more working memory capacity
     sparsity: float = 0.5     # fraction of Δ7 weights zeroed (biological sparse connectivity)
-    portal_heads: int = 4     # topographic portal — how many parallel channels in BU/LAL
-    bcn_momentum: float = 0.9 # EMA momentum for cache update (0.0=hard replace, 0.9=slow decay)
-                               # higher = cache holds information longer across steps
-                               # biological analogy: dopaminergic gating — synapses strengthen
-                               # proportionally to prediction error, not average state
+    portal_heads: int = 4     # topographic portal — BU/LAL convergence heads
+    kc_size: int = -1         # Kenyon cell expansion size (-1 = auto: 2×d_model, 0 = disabled)
+                               # expansion layer before bcn — sparse hash of portal activations
+                               # functional: wider → more discriminable sparse codes
+                               # biological: MB Kenyon cells expand 51 glomeruli → 2000 KCs
+                               # simplified: just expand + GELU + top-k (≈APL global inhibition)
+    ring_alpha: float = 0.1   # ring attractor conv strength (0=disabled)
+                               # biological: EB ring attractor — local excitation stabilizes cache bump
 
 
 
@@ -75,33 +77,34 @@ class FlyAttention(nn.Module):
         self.stream_dim = config.d_model // config.n_streams   # 768/16 = 48
         self.portal_dim = config.d_model // config.portal_heads # 768/4 = 192
 
-        # ── Parallel streams (PB columns) — stacked for TPU BatchMatMul ──────────
-        # Biologically: 16 independent PB columns, no cross-talk
-        # Implementation: single (16, 48, 48) weight tensor → one torch.matmul
-        # XLA treats the 16 dim as a hard batch wall — mathematically identical
-        # to 16 separate Linear layers but eliminates 16-node HLO graph bloat
+        # ── Parallel streams (PB columns) — fixed random orthogonal ─────────────
+        # Biologically: PB columns are genetically hardwired topographic maps.
+        # Fixed across all flies — no learning, no plasticity.
+        # Each column sees only its own slice of d_model (block-diagonal structure).
+        # Fixed orthogonal init — preserves signal magnitude, no gradient needed.
+        # Registered as buffer not Parameter — no gradient, no optimizer state.
         # Mobile export: weights.unbind(0) → 16 separate tensors for NPU inference
-        # xavier_uniform_ instead of orthogonal_ — safer in bfloat16
-        streams_blocks = [
-            torch.empty(self.stream_dim, self.stream_dim)
-            for _ in range(config.n_streams)
-        ]
-        for b in streams_blocks:
-            nn.init.xavier_uniform_(b)
-        self.streams_weight = nn.Parameter(torch.stack(streams_blocks))
-        self._cuda_streams = None  # lazy init for GPU parallel dispatch
+        streams_blocks = []
+        for _ in range(config.n_streams):
+            b = torch.empty(self.stream_dim, self.stream_dim)
+            nn.init.orthogonal_(b)
+            streams_blocks.append(b)
+        self.register_buffer('streams_weight', torch.stack(streams_blocks))
 
-        # ── Portal / BU-LAL — stacked for TPU BatchMatMul ────────────────────────
-        # Same treatment: (4, 192, 192) weight tensor → one torch.matmul
-        portal_blocks = [
-            torch.empty(self.portal_dim, self.portal_dim)
-            for _ in range(config.portal_heads)
-        ]
-        for b in portal_blocks:
-            nn.init.xavier_uniform_(b)
-        self.portal_weight = nn.Parameter(torch.stack(portal_blocks))
-        self._portal_cuda_streams = None
-        self.portal_norm = nn.LayerNorm(config.d_model)
+        # ── Portal / BU-LAL — fixed structured orthogonal ───────────────────────
+        # Biologically: BU-LAL convergence is anatomically fixed — highly ordered
+        # topographic convergence, same across all flies (194 distinct PB neuron types).
+        # Fixed orthogonal init — preserves norm, structured not random.
+        # Registered as buffer — no gradient, no optimizer state, O(1) memory.
+        # portal_norm IS learned — the scaling/shifting of the convergence output
+        # is the one place the portal can adapt (like Hebbian weight scaling).
+        portal_blocks = []
+        for _ in range(config.portal_heads):
+            b = torch.empty(self.portal_dim, self.portal_dim)
+            nn.init.orthogonal_(b)
+            portal_blocks.append(b)
+        self.register_buffer('portal_weight', torch.stack(portal_blocks))
+        self.portal_norm = nn.LayerNorm(config.d_model)  # learned — fine-tunes convergence
 
         # ── Bias Cachneck (bcn_*) ─────────────────────────────────────────────────────
         # Named bcn_* (not bottleneck_*) to clarify: this is NOT a data bottleneck.
@@ -113,11 +116,14 @@ class FlyAttention(nn.Module):
         # 8 neuron types (bcn_size=8 default), ~50% sparse connectivity.
         # They don't bottleneck the PB columns — they run alongside them as inhibitory
         # modulators, compressing population activity into a compact attractor state.
-        self.bcn_compress = nn.Linear(config.d_model, config.bcn_size, bias=False)
-        mask = torch.zeros(config.bcn_size, config.d_model)
-        n_connections = int(config.d_model * (1.0 - config.sparsity))
+        # bcn_compress input is KC output if KC enabled, else portal_out
+        _kc_size = config.kc_size if config.kc_size >= 0 else config.d_model * 2
+        _bcn_in = _kc_size if _kc_size > 0 else config.d_model
+        self.bcn_compress = nn.Linear(_bcn_in, config.bcn_size, bias=False)
+        mask = torch.zeros(config.bcn_size, _bcn_in)
+        n_connections = int(_bcn_in * (1.0 - config.sparsity))
         for i in range(config.bcn_size):
-            idx = torch.randperm(config.d_model)[:n_connections]
+            idx = torch.randperm(_bcn_in)[:n_connections]
             mask[i, idx] = 1.0
         self.register_buffer('bcn_mask', mask)
 
@@ -133,6 +139,52 @@ class FlyAttention(nn.Module):
         # ── Output projection ──────────────────────────────────────────────────────
         self.bcn_out = nn.Linear(config.bcn_size, config.d_model, bias=False)
         nn.init.normal_(self.bcn_out.weight, std=0.01)
+
+        # ── bcn_gate: learned write gate — how strongly to update cache ───────────
+        # sigmoid(gate) near 0.5 at init → balanced read/write
+        # model learns: high confidence step → gate→1 (write strongly)
+        #               low confidence step  → gate→0 (preserve existing state)
+        # biological analogy: dopaminergic gating
+        self.bcn_gate = nn.Linear(config.bcn_size, config.bcn_size, bias=True)
+        nn.init.zeros_(self.bcn_gate.weight)
+        nn.init.constant_(self.bcn_gate.bias, -1.0)  # start conservative — gate≈0.27, opens as surprise grows
+
+        # ── KC sparse expansion layer (MB Kenyon cells) ──────────────────────
+        # Expands portal representation → sparse hash via GELU + top-k
+        # GELU approximates the threshold nonlinearity of KC neurons
+        # top-k approximates APL global inhibition (one GABAergic neuron inhibits all KCs)
+        # Functional purpose: wider expansion → more discriminable sparse codes
+        # Biological: 51 glomeruli → 2000 KCs (40x expansion), ~5% active at once
+        # Our default: 2x expansion — enough discriminability, not too expensive
+        if _kc_size > 0:
+            # Fixed random sparse projection — biologically accurate:
+            # KC connectivity is random (confirmed by FlyWire connectome) but FIXED at birth
+            # Each KC connects to only ~6 random projection neurons (1-7 range)
+            # n_inputs_per_kc ≈ d_model * 6/n_projection_neurons ≈ 3-5% of d_model
+            n_inputs_per_kc = max(1, config.d_model // 20)  # ~5% sparse input per KC
+            kc_w = torch.zeros(_kc_size, config.d_model)
+            for i in range(_kc_size):
+                idx = torch.randperm(config.d_model)[:n_inputs_per_kc]
+                # random normal weights — not all equal strength (biological variation)
+                kc_w[i, idx] = torch.randn(n_inputs_per_kc) * (1.0 / n_inputs_per_kc) ** 0.5
+            self.register_buffer('kc_weight', kc_w)  # fixed, not learned
+            self._kc_size = _kc_size
+        else:
+            self.kc_weight = None
+            self._kc_size = 0
+
+        # ── Ring attractor conv (EB ring attractor) ──────────────────────────
+        # Small learned 1D circular conv — fixed topology, tiny learnable weights.
+        # Biological: EPG→EPG recurrent connections are topologically fixed (ring),
+        # but synapse strengths are finely tuned by evolution (not random).
+        # Center-surround init: local excitation + surround inhibition = bump dynamics.
+        # Only 5 parameters — can adapt the bump shape slightly for generalization.
+        # ring_alpha=0 → disabled, >0 → scales conv output before adding to cache.
+        self.ring_conv = nn.Conv1d(1, 1, kernel_size=5, padding=0, bias=False)
+        nn.init.constant_(self.ring_conv.weight, 0.0)
+        # center-surround init — excite center, inhibit surround
+        with torch.no_grad():
+            self.ring_conv.weight[0, 0] = torch.tensor([-0.1, 0.3, 1.0, 0.3, -0.1])
 
         # ── Cache — padded to 128 for TPU HBM alignment ───────────────────────────
         # Biologically: 8 Δ7 neurons. Physically: (128,) for TPU vector alignment.
@@ -159,7 +211,9 @@ class FlyAttention(nn.Module):
 
         # strip autograd history from cache at start of each forward
         # ensures Step N backward can't leak into Step N+1 graph
-        if self.training:
+        # set _suppress_training_detach=True for multi-step diffusion training
+        # where cache gradient SHOULD flow between steps
+        if self.training and not getattr(self, '_suppress_training_detach', False):
             self.cache_epg.detach_()
             self.cache_pen.detach_()
 
@@ -172,21 +226,10 @@ class FlyAttention(nn.Module):
         x_streams = x_biased.view(B, T, self.cfg.n_streams, self.stream_dim)
         x_streams = x_streams.permute(0, 2, 1, 3)  # (B, n_streams, T, stream_dim)
 
-        if x.is_cuda and self._cuda_streams is None:
-            self._cuda_streams = [torch.cuda.Stream() for _ in range(self.cfg.n_streams)]
-
-        if x.is_cuda:
-            # CUDA: explicit parallel stream dispatch per stream weight
-            stream_results = [None] * self.cfg.n_streams
-            for i, cuda_stream in enumerate(self._cuda_streams):
-                with torch.cuda.stream(cuda_stream):
-                    stream_results[i] = x_streams[:, i] @ self.streams_weight[i]
-            torch.cuda.synchronize()
-            stream_out_s = torch.stack(stream_results, dim=1)  # (B, n_streams, T, stream_dim)
-        else:
-            # XLA/TPU: single BatchMatMul — one HLO node, not 16
-            # streams_weight: (n_streams, stream_dim, stream_dim)
-            stream_out_s = torch.matmul(x_streams, self.streams_weight)  # (B, n_streams, T, stream_dim)
+        # single BatchMatMul on all hardware — streams_weight is a fixed buffer (no grad)
+        # at stream_dim=48, CUDA stream dispatch overhead exceeds parallelism benefit
+        # one batched matmul is faster than 16 separately dispatched tiny matmuls
+        stream_out_s = torch.matmul(x_streams, self.streams_weight)  # (B, n_streams, T, stream_dim)
 
         # reshape back: (B, n_streams, T, stream_dim) → (B, T, d_model)
         stream_out = stream_out_s.permute(0, 2, 1, 3).contiguous().view(B, T, D)
@@ -203,30 +246,69 @@ class FlyAttention(nn.Module):
         # clamp to bfloat16 safe range — gradient still flows, model learns to stay in range
         portal_out = portal_out.clamp(-1e4, 1e4)
 
-        # ── Step 3: bias cachneck ─────────────────────────────────────────────
-        # Apply sparse mask functionally — avoids .data mutation mid-forward
-        # which causes XLA to halt and recompile the graph
-        masked_bcn = self.bcn_compress.weight * self.bcn_mask
-        bottleneck = F.linear(portal_out, masked_bcn) + self.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
+        # ── Step 3a: KC sparse expansion (MB Kenyon cells) ───────────────────
+        # expand → GELU → top-k sparse → sparse hash of portal activations
+        # GELU ≈ KC threshold nonlinearity
+        # top-k ≈ APL global inhibition (keeps ~5% active)
+        # result: highly discriminable sparse code fed into bcn_compress
+        if self.kc_weight is not None:
+            # fixed random sparse expansion — no gradient through kc_weight
+            kc = F.gelu(F.linear(portal_out, self.kc_weight))       # (B, T, kc_size)
+            # APL global inhibition — single GABAergic neuron inhibits all KCs uniformly
+            # APL fires proportional to mean activity → only strongest KCs survive
+            # O(n) vs top-k O(n log n), differentiable, compiler-friendly
+            apl = kc.mean(dim=-1, keepdim=True)                      # mean field inhibition
+            portal_for_bcn = F.relu(kc - apl)                        # winners survive
+        else:
+            portal_for_bcn = portal_out
 
-        # ── Step 4: Cache update — EMA with momentum ──────────────────────────
-        # EMA instead of hard mean — lets transient peaks persist rather than
-        # being flattened immediately. Biological analogy: dopaminergic gating,
-        # synapses strengthen proportionally to prediction error, not average state.
-        # momentum=0.0 → hard replace (old behavior)
-        # momentum=0.9 → slow EMA, holds information longer
+        # ── Step 3b: PFL multiplicative modulation ────────────────────────────
+        # PFL neurons: two dendrites multiply heading × goal → error signal
+        # Here: portal × cache_expansion → "how does current input relate to cached state"
+        # Hadamard gate — cache state modulates what portal pays attention to
+        # biological: PFL1/2/3 coordinate transform, zero parameters
+        cache_bias = self.bcn_expand(self.cache_epg[:nb].clone())          # (d_model,) — clone needed: buffer modified later in same forward
+        portal_out = portal_out * (1.0 + cache_bias.unsqueeze(0).unsqueeze(0))
+
+        # ── Step 3c: bias cachneck compression ───────────────────────────────
+        # Apply sparse mask functionally — avoids .data mutation mid-forward
+        masked_bcn = self.bcn_compress.weight * self.bcn_mask
+        bottleneck = F.linear(portal_for_bcn, masked_bcn) +                      self.cache_pen[:nb].detach().unsqueeze(0).unsqueeze(0)
+
+        # ── Step 4: Cache update — velocity + surprise + ring attractor ───────
+        # Full biological stack:
+        #   velocity  = P-EN angular velocity neurons (rate of change)
+        #   surprise  = OA/dopamine prediction error (how unexpected is this?)
+        #   gate      = dopaminergic write gate driven by surprise
+        #   ring_conv = EB ring attractor (local excitation → stable bump)
         cache_prev = self.cache_epg.detach().clone()
 
-        raw_epg = bottleneck.detach().mean(dim=(0, 1)).clamp(-1e4, 1e4)
-        new_epg  = F.pad(raw_epg, (0, self._cache_pad - nb))
-        m = self.cfg.bcn_momentum
-        self.cache_epg.copy_(m * self.cache_epg + (1 - m) * new_epg)
+        with torch.no_grad():
+            bcn_mean = bottleneck.mean(dim=(0, 1)).clamp(-1e4, 1e4)  # (nb,)
+            velocity = bcn_mean - cache_prev[:nb]                     # P-EN: rate of change
+            surprise = velocity.abs().mean().clamp(0, 10)             # OA: prediction error
+            gate     = torch.sigmoid(
+                self.bcn_gate(bcn_mean) + 0.1 * surprise                    # surprise-driven gate
+            )                                                          # (nb,) in (0,1)
+            # integrate velocity into cache value (P-EN bump shift)
+            new_val  = (bcn_mean + 0.1 * velocity).clamp(-1e4, 1e4)  # (nb,)
+            # ring attractor — learned circular conv stabilizes cache into bump
+            if self.cfg.ring_alpha > 0:
+                v_conv = new_val.view(1, 1, nb)                       # (1,1,nb)
+                v_conv = F.pad(v_conv, (2, 2), mode='circular')       # circular padding
+                v_conv = self.ring_conv(v_conv)                        # (1,1,nb) learned conv
+                new_val = new_val + self.cfg.ring_alpha * v_conv.squeeze()
+
+        new_epg  = F.pad(new_val, (0, self._cache_pad - nb))
+        gate_pad = F.pad(gate,    (0, self._cache_pad - nb))
+        self.cache_epg.copy_(gate_pad * new_epg + (1 - gate_pad) * self.cache_epg)
 
         raw_pen  = self.bcn_read(portal_out.detach().mean(dim=(0, 1))).clamp(-1e4, 1e4)
         new_pen  = F.pad(raw_pen, (0, self._cache_pad - nb))
-        self.cache_pen.copy_(m * self.cache_pen + (1 - m) * new_pen)
+        self.cache_pen.copy_(gate_pad * new_pen + (1 - gate_pad) * self.cache_pen)
 
         # ── Step 5: Inhibitory output ─────────────────────────────────────────
+        # Subtracts what's established in cache from input → passes novel signal
         inhibition = self.bcn_out(bottleneck)
         out = x - inhibition
 
@@ -366,6 +448,8 @@ class FlyAttention(nn.Module):
 
         self.bcn_compress.weight.register_hook(_sparse_grad_hook)
 
+        # kc_weight is a fixed buffer — no gradient, no hook needed
+
     def param_count(self) -> dict[str, int]:
         """Breakdown of parameter counts per component."""
         return {
@@ -375,6 +459,8 @@ class FlyAttention(nn.Module):
             'bcn_expand':   self.bcn_expand.weight.numel(),
             'bcn_read':     self.bcn_read.weight.numel(),
             'bcn_out':      self.bcn_out.weight.numel(),
+            'kc_weight':    self.kc_weight.numel() if self.kc_weight is not None else 0,  # fixed buffer
+            'ring_conv':    self.ring_conv.weight.numel(),  # 5 learned params',
             'portal_norm':  sum(p.numel() for p in self.portal_norm.parameters()),
         }
 
@@ -518,22 +604,9 @@ class FlyAttentionPair(nn.Module):
         tok_s = tok_biased.view(B_tok, T_tok, n_streams, stream_dim).permute(0, 2, 1, 3)
         sys_s = sys_biased.view(B_sys, T_sys, n_streams, stream_dim).permute(0, 2, 1, 3)
 
-        if tok.is_cuda:
-            if self.tok_attn._cuda_streams is None:
-                self.tok_attn._cuda_streams = [torch.cuda.Stream() for _ in range(n_streams)]
-            tok_res = [None] * n_streams
-            sys_res = [None] * n_streams
-            for i, cs in enumerate(self.tok_attn._cuda_streams):
-                with torch.cuda.stream(cs):
-                    tok_res[i] = tok_s[:, i] @ self.tok_attn.streams_weight[i]
-                    sys_res[i] = sys_s[:, i] @ self.sys_attn.streams_weight[i]
-            torch.cuda.synchronize()
-            tok_stream_out = torch.stack(tok_res, dim=1).permute(0,2,1,3).contiguous().view(B_tok, T_tok, D)
-            sys_stream_out = torch.stack(sys_res, dim=1).permute(0,2,1,3).contiguous().view(B_sys, T_sys, D)
-        else:
-            # TPU: single BatchMatMul each
-            tok_stream_out = torch.matmul(tok_s, self.tok_attn.streams_weight).permute(0,2,1,3).contiguous().view(B_tok, T_tok, D)
-            sys_stream_out = torch.matmul(sys_s, self.sys_attn.streams_weight).permute(0,2,1,3).contiguous().view(B_sys, T_sys, D)
+        # single BatchMatMul on all hardware — no synchronize() overhead
+        tok_stream_out = torch.matmul(tok_s, self.tok_attn.streams_weight).permute(0,2,1,3).contiguous().view(B_tok, T_tok, D)
+        sys_stream_out = torch.matmul(sys_s, self.sys_attn.streams_weight).permute(0,2,1,3).contiguous().view(B_sys, T_sys, D)
 
         # ── Step 2: inter-portal bias injection ───────────────────────────────
         tok_stream_out, sys_stream_out = self.inter_portal([tok_stream_out, sys_stream_out])
@@ -549,23 +622,61 @@ class FlyAttentionPair(nn.Module):
             torch.matmul(sys_p, self.sys_attn.portal_weight).permute(0,2,1,3).contiguous().view(B_sys, T_sys, D))
         sys_portal_out = sys_portal_out.clamp(-1e4, 1e4)
 
-        # ── Step 4: bias cachneck + cache update — in-graph, no host sync ────
-        # Apply sparse mask functionally — no .data mutation mid-forward
+        # ── Step 4: KC expansion + PFL modulation + bias cachneck ────────────
         pad = self.tok_attn._cache_pad
+
+        # KC sparse expansion (MB Kenyon cells) — same as FlyAttention.forward Step 3a
+        def _kc_expand(attn, portal):
+            if attn.kc_weight is not None:
+                kc = F.gelu(F.linear(portal, attn.kc_weight))
+                apl = kc.mean(dim=-1, keepdim=True)   # APL global inhibition
+                return F.relu(kc - apl)                # winners survive
+            return portal
+
+        tok_for_bcn = _kc_expand(self.tok_attn, tok_portal_out)
+        sys_for_bcn = _kc_expand(self.sys_attn, sys_portal_out)
+
+        # PFL multiplicative modulation — cache gates what portal attends to
+        tok_portal_out = tok_portal_out * (1.0 + tok_epg_bias.unsqueeze(0).unsqueeze(0))
+        sys_portal_out = sys_portal_out * (1.0 + sys_epg_bias.unsqueeze(0).unsqueeze(0))
+
+        # Apply sparse mask functionally — no .data mutation mid-forward
         masked_tok_bcn = self.tok_attn.bcn_compress.weight * self.tok_attn.bcn_mask
         masked_sys_bcn = self.sys_attn.bcn_compress.weight * self.sys_attn.bcn_mask
 
-        tok_bottleneck = F.linear(tok_portal_out, masked_tok_bcn) + \
-                         self.tok_attn.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
-        sys_bottleneck = F.linear(sys_portal_out, masked_sys_bcn) + \
-                         self.sys_attn.cache_pen[:nb].detach().clone().unsqueeze(0).unsqueeze(0)
+        tok_bottleneck = F.linear(tok_for_bcn, masked_tok_bcn) + \
+                         self.tok_attn.cache_pen[:nb].detach().unsqueeze(0).unsqueeze(0)
+        sys_bottleneck = F.linear(sys_for_bcn, masked_sys_bcn) + \
+                         self.sys_attn.cache_pen[:nb].detach().unsqueeze(0).unsqueeze(0)
 
-        # EMA cache update — momentum prevents hard mean from flattening transient KV associations
-        m   = self.tok_attn.cfg.bcn_momentum
-        self.tok_attn.cache_epg.copy_(m * self.tok_attn.cache_epg + (1-m) * F.pad(tok_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
-        self.sys_attn.cache_epg.copy_(m * self.sys_attn.cache_epg + (1-m) * F.pad(sys_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4, 1e4), (0, pad-nb)))
-        self.tok_attn.cache_pen.copy_(m * self.tok_attn.cache_pen + (1-m) * F.pad(self.tok_attn.bcn_read(tok_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
-        self.sys_attn.cache_pen.copy_(m * self.sys_attn.cache_pen + (1-m) * F.pad(self.sys_attn.bcn_read(sys_portal_out.detach().mean(dim=(0,1))).clamp(-1e4, 1e4), (0, pad-nb)))
+        # velocity + surprise + ring attractor cache update (matches FlyAttention.forward)
+        with torch.no_grad():
+            tok_mean = tok_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4,1e4)
+            sys_mean = sys_bottleneck.detach().mean(dim=(0,1)).clamp(-1e4,1e4)
+            # P-EN velocity — rate of change
+            tok_vel  = tok_mean - self.tok_attn.cache_epg[:nb]
+            sys_vel  = sys_mean - self.sys_attn.cache_epg[:nb]
+            # OA surprise — prediction error drives gate
+            tok_surp = tok_vel.abs().mean().clamp(0, 10)
+            sys_surp = sys_vel.abs().mean().clamp(0, 10)
+            tok_gate = F.pad(torch.sigmoid(self.tok_attn.bcn_gate(tok_mean) + 0.1 * tok_surp), (0, pad-nb))
+            sys_gate = F.pad(torch.sigmoid(self.sys_attn.bcn_gate(sys_mean) + 0.1 * sys_surp), (0, pad-nb))
+            # integrate velocity
+            tok_new  = (tok_mean + 0.1 * tok_vel).clamp(-1e4,1e4)
+            sys_new  = (sys_mean + 0.1 * sys_vel).clamp(-1e4,1e4)
+            # ring attractor conv
+            ra = self.tok_attn.cfg.ring_alpha if hasattr(self.tok_attn.cfg, 'ring_alpha') else 0.1
+            if ra > 0:
+                def _ring(v, attn):
+                    vc = F.pad(v.view(1,1,-1), (2,2), mode='circular')
+                    return v + ra * attn.ring_conv(vc).squeeze()
+                tok_new = _ring(tok_new, self.tok_attn)
+                sys_new = _ring(sys_new, self.sys_attn)
+
+        self.tok_attn.cache_epg.copy_(tok_gate * F.pad(tok_new,(0,pad-nb)) + (1-tok_gate) * self.tok_attn.cache_epg)
+        self.sys_attn.cache_epg.copy_(sys_gate * F.pad(sys_new,(0,pad-nb)) + (1-sys_gate) * self.sys_attn.cache_epg)
+        self.tok_attn.cache_pen.copy_(tok_gate * F.pad(self.tok_attn.bcn_read(tok_portal_out.detach().mean(dim=(0,1))).clamp(-1e4,1e4),(0,pad-nb)) + (1-tok_gate) * self.tok_attn.cache_pen)
+        self.sys_attn.cache_pen.copy_(sys_gate * F.pad(self.sys_attn.bcn_read(sys_portal_out.detach().mean(dim=(0,1))).clamp(-1e4,1e4),(0,pad-nb)) + (1-sys_gate) * self.sys_attn.cache_pen)
 
         # ── Step 5: inhibitory output ──────────────────────────────────────────
         tok_out = tok - self.tok_attn.bcn_out(tok_bottleneck)
