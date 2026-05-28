@@ -165,7 +165,7 @@ class FlyAttention(nn.Module):
 
         # ── Step 1: Parallel streams — single BatchMatMul ─────────────────────
         # EPG cache bias: only use first nb slots, rest is padding
-        epg_bias = self.bcn_expand(self.cache_epg[:nb].detach().clone())
+        epg_bias = self.bcn_expand(self.cache_epg[:nb].clone())
         x_biased = x + epg_bias.unsqueeze(0).unsqueeze(0)
 
         # reshape for batched matmul: (B, T, d_model) → (B, n_streams, T, stream_dim)
@@ -508,8 +508,8 @@ class FlyAttentionPair(nn.Module):
             self.sys_attn.cache_pen.detach_()
 
         # ── Step 1: parallel streams — single BatchMatMul each ────────────────
-        tok_epg_bias = self.tok_attn.bcn_expand(self.tok_attn.cache_epg[:nb].detach().clone())
-        sys_epg_bias = self.sys_attn.bcn_expand(self.sys_attn.cache_epg[:nb].detach().clone())
+        tok_epg_bias = self.tok_attn.bcn_expand(self.tok_attn.cache_epg[:nb].clone())
+        sys_epg_bias = self.sys_attn.bcn_expand(self.sys_attn.cache_epg[:nb].clone())
 
         tok_biased = tok + tok_epg_bias.unsqueeze(0).unsqueeze(0)
         sys_biased = sys + sys_epg_bias.unsqueeze(0).unsqueeze(0)
