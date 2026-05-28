@@ -6,3 +6,6 @@ EDIT: probably most useful for long contexts(that the model was not trained on) 
 
 
 remember to save the weights from the random init it makes training more stable and prevents degradation randomizing every time just confuses the model
+
+
+might actually serve best in image stacking AIs for photography 
